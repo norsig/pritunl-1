@@ -26,22 +26,212 @@ sudo ufw allow 22,80,81,222,443,8080,9700,60000/tcp
 sudo ufw allow 22,80,81,222,443,8080,9700,60000/udp
 sudo yes | ufw enable
 
-# Change to Time GMT+8
-ln -fs /usr/share/zoneinfo/Asia/Kuala_Lumpur /etc/localtime
+sudo apt-get update
+sudo apt-get install apache2
+sudo apt-get install mysql-server libapache2-mod-auth-mysql php5-mysql
+sudo mysql_install_db
+sudo /usr/bin/mysql_secure_installation
+sudo apt-get install php5 libapache2-mod-php5 php5-mcrypt
 
-# Install Web Server
-apt-get -y install nginx php5-fpm php5-cli
-cd
-rm /etc/nginx/sites-enabled/default
-rm /etc/nginx/sites-available/default
-wget -O /etc/nginx/nginx.conf "https://raw.githubusercontent.com/zero9911/pritunl/master/conf/nginx.conf"
-mkdir -p /home/vps/public_html
-echo "<pre>Setup by MKSSHVPN </pre>" > /home/vps/public_html/index.html
-echo "<?php phpinfo(); ?>" > /home/vps/public_html/info.php
-wget -O /etc/nginx/conf.d/vps.conf "https://raw.githubusercontent.com/zero9911/pritunl/master/conf/vps.conf"
-sed -i 's/listen = \/var\/run\/php5-fpm.sock/listen = 127.0.0.1:9000/g' /etc/php5/fpm/pool.d/www.conf
-service php5-fpm restart
-service nginx restart
+## Install Modules
+sudo a2enmod rewrite
+## Suppress qualified domain name warning
+sudo sh -c 'echo "
+# Suppress qualified domain name warning
+ServerName localhost" >> /etc/apache2/apache2.conf'
+## Allow .htaccess files
+find="<Directory \/var\/www\/>\n\tOptions Indexes FollowSymLinks\n\tAllowOverride None\n\tRequire all granted\n<\/Directory>"
+replace="<Directory \/var\/www\/>\n\tOptions Indexes FollowSymLinks\n\tAllowOverride All\n\tRequire all granted\n<\/Directory>"
+sudo perl -0777 -i.original -pe "s/$find/$replace/igs" /etc/apache2/apache2.conf
+
+# create prod
+mkdir /var/www/html/docroot
+find /var/www/html -type f -exec chmod 644 {} +
+find /var/www/html -type d -exec chmod 775 {} +
+chown -R root:www-data /var/www/html
+
+# create stage
+mkdir /var/www/stage
+mkdir /var/www/stage/docroot
+find /var/www/stage -type f -exec chmod 644 {} +
+find /var/www/stage -type d -exec chmod 775 {} +
+chown root:www-data /var/www/stage
+
+# create symlink
+
+ln -s /var/www/stage/docroot /var/www/html/docroot/stage
+
+## Change docroot
+find="DocumentRoot \/var\/www\/html"
+replace="DocumentRoot \/var\/www\/html\/docroot"
+sudo perl -0777 -i.original -pe "s/$find/$replace/igs" /etc/apache2/sites-available/000-default.conf
+
+## Add user to www-data group
+sudo usermod -a -G www-data $USER
+
+sudo service apache2 restart
+
+# Create new database
+function create_new_db {
+  echo -n "Enter password for the MySQL root account: "
+  read -s rootpass
+  echo ""
+  Q00="CREATE DATABASE $dbname;"
+  Q01="USE $dbname;"
+  Q02="CREATE USER $dbuser@localhost IDENTIFIED BY '$dbpass';"
+  Q03="GRANT ALL PRIVILEGES ON $dbname.* TO $dbuser@localhost;"
+  Q04="FLUSH PRIVILEGES;"
+  SQL0="${Q00}${Q01}${Q02}${Q03}${Q04}"
+  mysql -v -u "root" -p$rootpass -e"$SQL0"
+}
+
+# Download WordPress, modify wp-config.php, set permissions
+function install_wp {
+  wget http://wordpress.org/latest.tar.gz
+  tar xzvf latest.tar.gz
+  cp -rf wordpress/** ./
+  rm -R wordpress
+  cp wp-config-sample.php wp-config.php
+  sed -i "s/database_name_here/$dbname/g" wp-config.php
+  sed -i "s/username_here/$dbuser/g" wp-config.php
+  sed -i "s/password_here/$dbpass/g" wp-config.php
+  wget -O wp.keys https://api.wordpress.org/secret-key/1.1/salt/
+  sed -i '/#@-/r wp.keys' wp-config.php
+  sed -i "/#@+/,/#@-/d" wp-config.php
+  mkdir wp-content/uploads
+  find . -type d -exec chmod 755 {} \;
+  find . -type f -exec chmod 644 {} \;
+  chown -R :www-data wp-content/uploads
+  chown -R $USER:www-data *
+  chmod 640 wp-config.php
+  rm -f latest.tar.gz
+  rm -f wp-install.sh
+  rm -f wp.keys
+}
+
+# Create .htaccess file
+function generate_htaccess {
+  touch .htaccess
+  chown :www-data .htaccess
+  chmod 644 .htaccess
+  bash -c "cat > .htaccess" << _EOF_
+# Block the include-only files.
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteBase /
+RewriteRule ^wp-admin/includes/ - [F,L]
+RewriteRule !^wp-includes/ - [S=3]
+RewriteRule ^wp-includes/[^/]+\.php$ - [F,L]
+RewriteRule ^wp-includes/js/tinymce/langs/.+\.php - [F,L]
+RewriteRule ^wp-includes/theme-compat/ - [F,L]
+</IfModule>
+
+# BEGIN WordPress
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteBase /
+RewriteRule ^index\.php$ - [L]
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule . /index.php [L]
+</IfModule>
+# END WordPress
+
+# Prevent viewing of .htaccess file
+<Files .htaccess>
+order allow,deny
+deny from all
+</Files>
+# Prevent viewing of wp-config.php file
+<files wp-config.php>
+order allow,deny
+deny from all
+</files>
+# Prevent directory listings
+Options All -Indexes
+_EOF_
+}
+
+# Create robots.txt file
+function generate_robots {
+  touch robots.txt
+  bash -c "cat > robots.txt" << _EOF_
+# Sitemap: absolute url
+User-agent: *
+Disallow: /cgi-bin/
+Disallow: /wp-admin/
+Disallow: /wp-includes/
+Disallow: /wp-content/plugins/
+Disallow: /wp-content/cache/
+Disallow: /wp-content/themes/
+Disallow: /trackback/
+Disallow: /comments/
+Disallow: */trackback/
+Disallow: */comments/
+Disallow: wp-login.php
+Disallow: wp-signup.php
+_EOF_
+}
+
+# Download WordPress plugins
+function download_plugins {
+  cd wp-content/plugins/
+  # W3 Total Cache
+  plugin_url=$(curl -s https://wordpress.org/plugins/w3-total-cache/ | egrep -o "https://downloads.wordpress.org/plugin/[^']+")
+  wget $plugin_url
+  # Theme Test Drive
+  plugin_url=$(curl -s https://wordpress.org/plugins/theme-test-drive/ | egrep -o "https://downloads.wordpress.org/plugin/[^']+")
+  wget $plugin_url
+  # Login LockDown
+  plugin_url=$(curl -s https://wordpress.org/plugins/login-lockdown/ | egrep -o "https://downloads.wordpress.org/plugin/[^']+")
+  wget $plugin_url
+  # Easy Theme and Plugin Upgrades
+  plugin_url=$(curl -s https://wordpress.org/plugins/easy-theme-and-plugin-upgrades/ | egrep -o "https://downloads.wordpress.org/plugin/[^']+")
+  wget $plugin_url
+  # Install unzip package
+  apt-get install unzip
+  # Unzip all zip files
+  unzip \*.zip
+  # Remove all zip files
+  rm -f *.zip
+  echo ""
+  cd ../..
+}
+
+
+##### User inputs
+
+echo -n "WordPress database name: "
+read dbname
+echo -n "WordPress database user: "
+read dbuser
+echo -n "WordPress database password: "
+read -s dbpass
+echo ""
+echo -n "Install Wordpress? [Y/n] "
+read instwp
+echo -n "Create a NEW database with entered info? [Y/n] "
+read newdb
+
+
+##### Main
+
+if [ "$newdb" = y ] || [ "$newdb" = Y ]
+then
+  create_new_db
+  install_wp
+  generate_htaccess
+  generate_robots
+  download_plugins
+else
+  if [ "$instwp" = y ] || [ "$instwp" = Y ]
+  then
+    install_wp
+    generate_htaccess
+    generate_robots
+    download_plugins
+  fi
+fi
 
 # Install Vnstat
 apt-get -y install vnstat
@@ -64,16 +254,11 @@ cd
 
 # About
 clear
-echo "Script ini hanya mengandungi :-"
 echo "-Pritunl"
 echo "-MongoDB"
 echo "-Vnstat"
 echo "-Web Server"
 echo "-Squid Proxy Port 7166,60000"
-echo "BY MKSSHVPN"
-echo "TimeZone   :  Malaysia"
 echo "Vnstat     :  http://$MYIP:81/vnstat"
 echo "Pritunl    :  https://$MYIP"
-echo "Sila login ke pritunl untuk proceed step seterusnya"
-echo "Sila copy code dibawah untuk Pritunl anda"
 pritunl setup-key
